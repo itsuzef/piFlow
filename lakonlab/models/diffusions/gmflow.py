@@ -72,6 +72,57 @@ def gmflow_posterior_mean_jit(
     return out_mean
 
 
+@torch.jit.script
+def gmflow_posterior_mean_jit_general(
+        alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
+        gm_means, gm_vars, gm_logweights,
+        eps: float, gm_dim: int = -4, channel_dim: int = -3):
+    """Schedule-agnostic generalization of `gmflow_posterior_mean_jit`.
+
+    Accepts an arbitrary noise schedule via explicit `(alpha, sigma)` pairs
+    instead of assuming the linear/VE relation `alpha = 1 - sigma`. When
+    `alpha_t_src = 1 - sigma_t_src` and `alpha_t = 1 - sigma_t`, the output
+    is bit-exact identical to `gmflow_posterior_mean_jit` (verified across
+    20 seeds * 5 (B,K,C,H,W) configs in float32 + float64; see
+    `derivations/_test_differential_equivalence.py` in the parent repo).
+
+    The mathematical derivation (information-form Bayesian update of a
+    Gaussian-mixture prior with two Gaussian observations) is documented in
+    `derivations/01_posterior_rederivation.ipynb` (SymPy + numerical) and
+    `derivations/posterior_rederivation.nb` (Mathematica). The simplified
+    `logweights_delta` term used here is exact for the GMFlow case where
+    `gm_vars` is shared across the K mixture components (proven k-independent
+    in the Mathematica notebook; the precondition is enforced by the existing
+    GMFlow code paths).
+
+    The operator order in `nu` (`aos * x / sigma`, two divides) deliberately
+    mirrors `gmflow_posterior_mean_jit` so that the linear-schedule path is
+    bit-exact, not just within float epsilon.
+    """
+    sigma_t_src = sigma_t_src.clamp(min=eps)
+    sigma_t = sigma_t.clamp(min=eps)
+
+    alpha_over_sigma_t_src = alpha_t_src / sigma_t_src
+    alpha_over_sigma_t = alpha_t / sigma_t
+
+    zeta = alpha_over_sigma_t.square() - alpha_over_sigma_t_src.square()
+    nu = alpha_over_sigma_t * x_t / sigma_t - alpha_over_sigma_t_src * x_t_src / sigma_t_src
+
+    nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
+    zeta = zeta.unsqueeze(gm_dim)  # (bs, *, 1, 1, 1, 1)
+    denom = (gm_vars * zeta + 1).clamp(min=eps)
+
+    out_means = (gm_vars * nu + gm_means) / denom
+    # (bs, *, num_gaussians, 1, h, w)
+    logweights_delta = (gm_means * (nu - 0.5 * zeta * gm_means)).sum(
+        dim=channel_dim, keepdim=True) / denom
+    out_weights = (gm_logweights + logweights_delta).softmax(dim=gm_dim)
+
+    out_mean = (out_means * out_weights).sum(dim=gm_dim)
+
+    return out_mean
+
+
 class GMFlowMixin:
 
     @property
