@@ -168,10 +168,18 @@ class GMFlowMixin:
 
     def gmflow_posterior_mean(
             self, gm, x_t, x_t_src, t=None, t_src=None,
-            sigma_t_src=None, sigma_t=None, eps=1e-6, prediction_type='x0',
+            sigma_t_src=None, sigma_t=None,
+            alpha_t_src=None, alpha_t=None,
+            eps=1e-6, prediction_type='x0',
             checkpointing=False):
         """
         Fuse gmflow_posterior and gm_to_mean to avoid redundant computation.
+
+        Pass `alpha_t_src` and/or `alpha_t` to select a non-linear noise
+        schedule (e.g. VP: alpha=cos(pi*t/2), sigma=sin(pi*t/2)); the missing
+        member of the pair is filled in with `1 - sigma`. When both are
+        omitted, the call routes to the legacy `gmflow_posterior_mean_jit`
+        and behavior is bit-exact identical to prior versions.
         """
         assert isinstance(gm, dict)
 
@@ -200,16 +208,26 @@ class GMFlowMixin:
             gm_vars = (gm['logstds'] * 2).exp()  # (bs, *, 1, 1, 1, 1)
             gm['gm_vars'] = gm_vars
 
+        use_general = alpha_t_src is not None or alpha_t is not None
+        if use_general:
+            if alpha_t_src is None:
+                alpha_t_src = 1 - sigma_t_src
+            if alpha_t is None:
+                alpha_t = 1 - sigma_t
+            jit_fn = gmflow_posterior_mean_jit_general
+            args = (alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
+                    gm_means, gm_vars, gm_logweights, eps)
+        else:
+            jit_fn = gmflow_posterior_mean_jit
+            args = (sigma_t_src, sigma_t, x_t_src, x_t,
+                    gm_means, gm_vars, gm_logweights, eps)
+
         if checkpointing and torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(
-                gmflow_posterior_mean_jit,
-                sigma_t_src, sigma_t, x_t_src, x_t,
-                gm_means, gm_vars, gm_logweights, eps,
+                jit_fn, *args,
                 use_reentrant=True)  # use_reentrant=False does not work with jit
         else:
-            return gmflow_posterior_mean_jit(
-                sigma_t_src, sigma_t, x_t_src, x_t,
-                gm_means, gm_vars, gm_logweights, eps)
+            return jit_fn(*args)
 
     def reverse_transition(self, denoising_output, x_t_high, t_low, t_high, eps=1e-6, prediction_type='u'):
         if isinstance(denoising_output, dict):
