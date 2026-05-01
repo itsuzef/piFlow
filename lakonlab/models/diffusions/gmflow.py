@@ -226,10 +226,10 @@ class GMFlowMixin:
 
         use_general = alpha_t_src is not None or alpha_t is not None
         if use_general:
-            if alpha_t_src is None:
-                alpha_t_src = 1 - sigma_t_src
-            if alpha_t is None:
-                alpha_t = 1 - sigma_t
+            if alpha_t_src is None or alpha_t is None:
+                raise ValueError(
+                    "Pass both alpha_t_src and alpha_t, or neither. "
+                    "Passing only one is ambiguous and was never safe.")
             # Analytic zeta clamp: prevents gm_vars*zeta overflow under VP
             # schedule at small t.  Assumes max(gm_vars) ≤ 10 (see Q1 in
             # 03_rollout_plan.md §6).  Use float32 finfo even for mixed
