@@ -5,6 +5,12 @@ import torch
 from typing import Dict
 from .base import BasePolicy
 from ..gmflow import gmflow_posterior_mean_jit
+# C4 (03_rollout_plan.md §2.2): GMFlowPolicy does not subclass GMFlowMixin,
+# so it cannot reach gmflow_posterior_mean() wrapper. These call sites are
+# intentionally schedule-locked to the linear schedule (alpha = 1 - sigma).
+# To opt into a non-linear schedule here, inject the bound wrapper method
+# or subclass GMFlowMixin (see C4 option (a) in the plan). Until then, any
+# schedule-agnostic sampling must be done at the pipeline level, not here.
 from lakonlab.ops.gmflow_ops.gmflow_ops import gm_temperature
 
 
@@ -70,7 +76,7 @@ class GMFlowPolicy(BasePolicy):
         else:
             if self.checkpointing and torch.is_grad_enabled():
                 x_0 = torch.utils.checkpoint.checkpoint(
-                    gmflow_posterior_mean_jit,
+                    gmflow_posterior_mean_jit,  # linear schedule only — see C4 comment above
                     self.sigma_t_src, sigma_t, self.x_t_src, x_t,
                     means,
                     gm_vars,
@@ -78,7 +84,7 @@ class GMFlowPolicy(BasePolicy):
                     self.eps, 1, 2,
                     use_reentrant=True)  # use_reentrant=False does not work with jit
             else:
-                x_0 = gmflow_posterior_mean_jit(
+                x_0 = gmflow_posterior_mean_jit(  # linear schedule only — see C4 comment above
                     self.sigma_t_src, sigma_t, self.x_t_src, x_t,
                     means,
                     gm_vars,
