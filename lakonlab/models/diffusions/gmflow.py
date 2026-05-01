@@ -59,6 +59,10 @@ def gmflow_posterior_mean_jit(
 
     nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
     zeta = zeta.unsqueeze(gm_dim)  # (bs, *, 1, 1, 1, 1)
+    torch._assert(gm_vars.size(gm_dim) == 1,
+                  "gm_vars must be shared across mixture components (size at gm_dim != 1)")
+    torch._assert(gm_vars.size(channel_dim) == 1,
+                  "gm_vars must be shared across channels (size at channel_dim != 1)")
     denom = (gm_vars * zeta + 1).clamp(min=eps)
 
     out_means = (gm_vars * nu + gm_means) / denom
@@ -118,6 +122,10 @@ def gmflow_posterior_mean_jit_general(
 
     nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
     zeta = zeta.unsqueeze(gm_dim)  # (bs, *, 1, 1, 1, 1)
+    torch._assert(gm_vars.size(gm_dim) == 1,
+                  "gm_vars must be shared across mixture components (size at gm_dim != 1)")
+    torch._assert(gm_vars.size(channel_dim) == 1,
+                  "gm_vars must be shared across channels (size at channel_dim != 1)")
     denom = (gm_vars * zeta + 1).clamp(min=eps)
 
     out_means = (gm_vars * nu + gm_means) / denom
