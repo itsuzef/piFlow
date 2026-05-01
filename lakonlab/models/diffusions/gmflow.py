@@ -76,7 +76,8 @@ def gmflow_posterior_mean_jit(
 def gmflow_posterior_mean_jit_general(
         alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
         gm_means, gm_vars, gm_logweights,
-        eps: float, gm_dim: int = -4, channel_dim: int = -3):
+        eps: float, zeta_max: float = float('inf'),
+        gm_dim: int = -4, channel_dim: int = -3):
     """Schedule-agnostic generalization of `gmflow_posterior_mean_jit`.
 
     Accepts an arbitrary noise schedule via explicit `(alpha, sigma)` pairs
@@ -98,6 +99,12 @@ def gmflow_posterior_mean_jit_general(
     The operator order in `nu` (`aos * x / sigma`, two divides) deliberately
     mirrors `gmflow_posterior_mean_jit` so that the linear-schedule path is
     bit-exact, not just within float epsilon.
+
+    `zeta_max`: analytic clamp on zeta before the denom computation. Prevents
+    overflow in `gm_vars * zeta + 1` for extreme (alpha/sigma) ratios, e.g.
+    VP schedule at very small t. Default `inf` disables the clamp (preserving
+    pre-C1 behaviour). The wrapper passes `torch.finfo(dtype).max / 10.0`
+    (assuming max var_k ≤ 10; see 03_rollout_plan.md §2.2 C1, Q1).
     """
     sigma_t_src = sigma_t_src.clamp(min=eps)
     sigma_t = sigma_t.clamp(min=eps)
@@ -106,6 +113,7 @@ def gmflow_posterior_mean_jit_general(
     alpha_over_sigma_t = alpha_t / sigma_t
 
     zeta = alpha_over_sigma_t.square() - alpha_over_sigma_t_src.square()
+    zeta = zeta.clamp(min=-zeta_max, max=zeta_max)
     nu = alpha_over_sigma_t * x_t / sigma_t - alpha_over_sigma_t_src * x_t_src / sigma_t_src
 
     nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
@@ -214,9 +222,15 @@ class GMFlowMixin:
                 alpha_t_src = 1 - sigma_t_src
             if alpha_t is None:
                 alpha_t = 1 - sigma_t
+            # Analytic zeta clamp: prevents gm_vars*zeta overflow under VP
+            # schedule at small t.  Assumes max(gm_vars) ≤ 10 (see Q1 in
+            # 03_rollout_plan.md §6).  Use float32 finfo even for mixed
+            # precision — erring conservative is safe; the clamp only fires
+            # at extreme (alpha/sigma) ratios outside normal sampling ranges.
+            _zeta_max = float(torch.finfo(gm_vars.dtype).max) / 10.0
             jit_fn = gmflow_posterior_mean_jit_general
             args = (alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
-                    gm_means, gm_vars, gm_logweights, eps)
+                    gm_means, gm_vars, gm_logweights, eps, _zeta_max)
         else:
             jit_fn = gmflow_posterior_mean_jit
             args = (sigma_t_src, sigma_t, x_t_src, x_t,
