@@ -167,8 +167,13 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
                     # `t` and `t_base` are tensors (from scheduler.timesteps),
                     # so use torch trig.
                     if vp_mode:
-                        t_bar = t / self.time_scaling
-                        t_src_bar = t_base / self.time_scaling
+                        # Reshape to match x_t's rank so the JIT's unsqueeze(-4)
+                        # has dims to operate on.  x_t is (B, C, H, W), so we
+                        # reshape scalars to (1, 1, 1, 1).
+                        t_bar = (t / self.time_scaling).reshape(
+                            *((1,) * x_t.dim()))
+                        t_src_bar = (t_base / self.time_scaling).reshape(
+                            *((1,) * x_t.dim()))
                         alpha_t = torch.cos(torch.pi * t_bar / 2)
                         alpha_t_src = torch.cos(torch.pi * t_src_bar / 2)
                         sigma_t = torch.sin(torch.pi * t_bar / 2)
