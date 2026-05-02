@@ -180,6 +180,27 @@ class FourierPolicy(BasePolicy):
         tau = 1 - sigma_t / sigma_t_src_safe
         return self.df_dtau(tau) * (-1.0 / sigma_t_src_safe)
 
+    def closed_form_step(self, sigma_t_dst):
+        """Return f(τ_dst) — the closed-form destination state on the Fourier curve.
+
+        Bypasses the Euler substep loop in policy_rollout. Valid because f(τ) is
+        analytic; the substep loop exists for policies (GMFlow, DX) whose pi is
+        not the derivative of a closed-form curve. See e5-sampler-orientation.md §3 B2.
+
+        Args:
+            sigma_t_dst: destination noise level, shape (B,) or scalar.
+
+        Returns:
+            torch.Tensor: f(τ_dst), shape matching x_t_src.
+        """
+        if not isinstance(sigma_t_dst, torch.Tensor):
+            sigma_t_dst = torch.tensor(
+                sigma_t_dst, device=self.x_t_src.device, dtype=self.x_t_src.dtype)
+        sigma_t_dst = sigma_t_dst.reshape(
+            *sigma_t_dst.size(), *((self.ndim - sigma_t_dst.dim()) * [1]))
+        tau_dst = 1 - sigma_t_dst / self.sigma_t_src.clamp(min=self.eps)
+        return self.f(tau_dst)
+
     def copy(self):
         new_policy = self.__class__.__new__(self.__class__)
         new_policy.__dict__.update(self.__dict__)
