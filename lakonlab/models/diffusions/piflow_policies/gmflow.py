@@ -5,12 +5,21 @@ import torch
 from typing import Dict
 from .base import BasePolicy
 from ..gmflow import gmflow_posterior_mean_jit
-# C4 (03_rollout_plan.md §2.2): GMFlowPolicy does not subclass GMFlowMixin,
-# so it cannot reach gmflow_posterior_mean() wrapper. These call sites are
-# intentionally schedule-locked to the linear schedule (alpha = 1 - sigma).
-# To opt into a non-linear schedule here, inject the bound wrapper method
-# or subclass GMFlowMixin (see C4 option (a) in the plan). Until then, any
-# schedule-agnostic sampling must be done at the pipeline level, not here.
+# C4 (see derivations/03_rollout_plan.md, "VP completeness" section):
+# This file is intentionally schedule-locked to alpha = 1 - sigma. Three
+# surfaces inside this class assume the linear/VE forward process; routing
+# a non-linear (alpha, sigma) here would silently miscompute on each one:
+#   1. gmflow_posterior_mean_jit (imported above) is the legacy JIT, not the
+#      schedule-agnostic _general variant. The class does not subclass
+#      GMFlowMixin, so it cannot reach the dispatching wrapper.
+#   2. _u_to_x_0 below uses x_0 = x_t - sigma * u, which is exact only when
+#      alpha = 1 - sigma. Under VP this returns wrong x_0 estimates.
+#   3. _u_to_x_0 also rescales gm_vars as exp(2*logstds) * sigma**2, another
+#      VE-only form. The VP form is not just an alpha factor; it needs to
+#      be re-derived (see the rollout plan's VP completeness table).
+# Routing a non-linear schedule into this policy requires fixing all three
+# in a coordinated change. Until then, schedule-agnostic sampling must be
+# done at the pipeline level, not here.
 from lakonlab.ops.gmflow_ops.gmflow_ops import gm_temperature
 
 
