@@ -30,8 +30,10 @@ import torch
 
 from typing import Dict
 
+from .base import BasePolicy
 
-class FourierPolicy:
+
+class FourierPolicy(BasePolicy):
     """Fourier policy. Represents the diffusion path between anchors as a
     boundary-pinned Fourier curve in τ ∈ [0, 1].
 
@@ -148,3 +150,48 @@ class FourierPolicy:
         correction_deriv = (self.fourier_sin_coeffs * (m * math.pi) * cos_mpi_tau).sum(dim=1)
 
         return boundary_deriv + correction_deriv
+
+    def pi(self, x_t, sigma_t):
+        """Compute the F2 flow velocity u_t = ∂_σ f at the query σ_t.
+
+        The Fourier path f(τ) is parametrised in τ(σ) = 1 − σ/σ_t_src
+        (R1.2 §4); the F2 chain rule (R1.2 §5.4(a)) gives
+
+            u = ∂_σ f = (∂_τ f) · (dτ/dσ) = −(1/σ_t_src) · df_dtau(τ).
+
+        Note: the query x_t is not consumed — the Fourier curve is
+        determined entirely by the cached anchors (x_t_src, x̂_0) and
+        coefficients {a_m}; departures of the actual sample from the
+        modelled curve are absorbed at the next denoising call, not here.
+        The argument is kept for BasePolicy contract parity with
+        GMFlowPolicy and DXPolicy.
+
+        Args:
+            x_t (torch.Tensor): Noisy input at time t. Shape matches
+                x_t_src.
+            sigma_t (torch.Tensor): Noise level at t. Shape (B,) or
+                broadcast-compatible with x_t.
+
+        Returns:
+            torch.Tensor: Flow velocity u_t, shape matching x_t.
+        """
+        sigma_t = sigma_t.reshape(*sigma_t.size(), *((self.ndim - sigma_t.dim()) * [1]))
+        sigma_t_src_safe = self.sigma_t_src.clamp(min=self.eps)
+        tau = 1 - sigma_t / sigma_t_src_safe
+        return self.df_dtau(tau) * (-1.0 / sigma_t_src_safe)
+
+    def copy(self):
+        new_policy = self.__class__.__new__(self.__class__)
+        new_policy.__dict__.update(self.__dict__)
+        return new_policy
+
+    def detach_(self):
+        self.x_t_src = self.x_t_src.detach()
+        self.x_hat_0 = self.x_hat_0.detach()
+        self.fourier_sin_coeffs = self.fourier_sin_coeffs.detach()
+        self.sigma_t_src = self.sigma_t_src.detach()
+        return self
+
+    def detach(self):
+        new_policy = self.copy()
+        return new_policy.detach_()
