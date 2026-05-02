@@ -1,18 +1,21 @@
-"""E1 cosine-VP smoke tests.
+"""Cosine-VP smoke tests for the schedule-agnostic posterior-mean dispatch.
 
-D3a — VP forward pass with `_smoke_test_vp = True` runs end-to-end without
-NaN/Inf and emits the expected one-shot RuntimeWarning about `u_to_x_0`.
+Test 1 (vp_forward_no_nan) — VP forward pass with `_smoke_test_vp = True`
+runs end-to-end without NaN/Inf and emits the expected one-shot
+RuntimeWarning about `u_to_x_0`.
 
-D3b — Calling `gmflow_posterior_mean` with explicit `alpha_t = 1 − sigma_t`
-kwargs is bit-exact identical to the legacy no-kwargs path. Guards against
-regressions on the linear codepath when adding the schedule-agnostic dispatch.
+Test 2 (linear_equivalence) — Calling `gmflow_posterior_mean` with explicit
+`alpha_t = 1 − sigma_t` kwargs is bit-exact identical to the legacy
+no-kwargs path. Guards against regressions on the linear codepath when the
+schedule-agnostic dispatch is active.
 
-CPU only. No real checkpoints. Tests target the wrapper-level API; for D3a a
-minimal `GMDiTPipeline` instance is built via `__new__` with stubbed
-transformer/vae/scheduler so we exercise the actual `__call__` flow.
+CPU only. No real checkpoints. Tests target the wrapper-level API; for the
+VP forward-pass test a minimal `GMDiTPipeline` instance is constructed via
+`__new__` with stubbed transformer/vae/scheduler so the actual `__call__`
+flow is exercised.
 
 Run from repo root:
-    pytest -x repos/piFlow/tests/test_e1_smoke.py
+    pytest -x tests/test_e1_smoke.py
 """
 
 import warnings
@@ -31,8 +34,8 @@ from lakonlab.pipelines.pipeline_gmdit import GMDiTPipeline
 
 
 # ---------------------------------------------------------------------------
-# D3b — bit-exact equivalence: legacy linear path vs. general path with
-#       alpha_t = 1 - sigma_t passed as kwargs.
+# Test 2 — bit-exact equivalence: legacy linear path vs. general path with
+#           alpha_t = 1 - sigma_t passed as kwargs.
 # ---------------------------------------------------------------------------
 
 class _BareMixin(GMFlowMixin):
@@ -62,14 +65,14 @@ def _make_gm(B=1, K=2, C=3, H=4, W=4, seed=0):
     )
 
 
-def test_d3b_linear_equivalence():
-    """D3b: passing alpha_t = 1 - sigma_t explicitly via kwargs must give
+def test_linear_equivalence():
+    """Passing alpha_t = 1 - sigma_t explicitly via kwargs must give
     the same output as the legacy no-kwargs path, bit-exact.
 
-    Why bit-exact (not allclose): the wrapper docstring at gmflow.py:88-92
-    promises this is bit-exact across 20 seeds * 5 (B,K,C,H,W) configs in
-    fp32+fp64. A regression that drifts even one ULP would still indicate
-    a divergence between the two code paths and is worth catching loudly.
+    Why bit-exact (not allclose): the wrapper promises bit-exact agreement
+    across seeds and tensor configs in fp32+fp64. A regression that drifts
+    even one ULP still indicates a divergence between the two code paths
+    and is worth catching loudly.
     """
     mixin = _BareMixin(num_timesteps=1000)
     B, C, H, W = 1, 3, 4, 4
@@ -109,11 +112,11 @@ def test_d3b_linear_equivalence():
 
 
 # ---------------------------------------------------------------------------
-# D3a — VP forward pass: full GMDiTPipeline.__call__ runs with
-#       _smoke_test_vp = True, emits one RuntimeWarning, output is finite.
+# Test 1 — VP forward pass: full GMDiTPipeline.__call__ runs with
+#           `_smoke_test_vp = True`, output is finite, exactly one warning.
 # ---------------------------------------------------------------------------
 
-# Shapes used by the D3a fixture.  Kept tiny: 1 batch, 2 mixture components,
+# Shapes used by the VP forward-pass fixture.  Kept tiny: 1 batch, 2 mixture components,
 # 2 channels, 4x4 spatial.
 _B = 1
 _K = 2
@@ -192,14 +195,14 @@ def _build_pipeline(monkeypatch):
     return pipe
 
 
-def test_d3a_vp_forward_no_nan(monkeypatch):
-    """D3a: with `_smoke_test_vp = True`, the pipeline runs through the
+def test_vp_forward_no_nan(monkeypatch):
+    """With `_smoke_test_vp = True`, the pipeline runs through the
     schedule-agnostic JIT dispatch end-to-end, emits exactly one
     RuntimeWarning about `u_to_x_0`, and produces finite output.
 
-    The warning is captured (not silenced) per the E1-decisions D1b update:
-    the gate is signal-only, allowing the smoke test to exercise the wiring
-    while keeping the linear-`u_to_x_0` caveat visible to every future caller.
+    The warning is captured (not silenced): the gate is signal-only,
+    allowing the smoke test to exercise the dispatch wiring while keeping
+    the linear-`u_to_x_0` limitation visible to future callers.
     """
     pipe = _build_pipeline(monkeypatch)
     pipe._smoke_test_vp = True

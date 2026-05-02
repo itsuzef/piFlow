@@ -1,24 +1,19 @@
-"""FourierOutput2D — transformer head for the Idea-1 Fourier policy.
+"""FourierOutput2D — transformer head for the Fourier policy.
 
 Produces the two tensors consumed by `FourierPolicy`:
     • x_hat_0           — predicted clean sample, (B, C, H, W).
     • fourier_sin_coeffs — sin-series coefficients a_m(ξ), (B, M, C, H, W).
 
-Design references:
-    • personal-docs/worknotes/design/fourier-output2d-orientation.md §4
-      — proposed analog of GMOutput2D, channel formula, init strategy.
-    • personal-docs/worknotes/design/idea1-basis-choice.md (R4)
-      — B0 (linear) boundary + sin-only residual decision.
-    • repos/piFlow/lakonlab/models/architecture/gmflow/gm_output.py
-      — structural mirror (reshape head; spatial projection lives in the
-      transformer, not in this module).
+Designed as a pure-reshape head mirroring the structure of GMOutput2D.
+No learnable parameters in v1; the spatial projection lives in the
+transformer backbone, not in this module.
 
 Scope v1:
     • 2D only — image-shape spatial axes (H, W). 5D/video deferred.
     • Pure reshape — no Linear, no activation, no logstd MLP.
-    • Schedule-locked first cut: this head is agnostic to the σ-schedule,
-      but FourierPolicy assumes α = 1 − σ (see fourier.py C4 comment),
-      so cross-schedule deployment requires a coordinated change there.
+    • Schedule-locked first cut: FourierPolicy assumes α = 1 − σ
+      (see fourier.py schedule note), so cross-schedule deployment
+      requires a coordinated change in both files.
 """
 
 import torch

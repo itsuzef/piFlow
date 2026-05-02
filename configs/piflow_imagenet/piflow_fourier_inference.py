@@ -1,19 +1,17 @@
-# Idea-1 FourierPolicy inference recipe — Track A integration.
+# FourierPolicy inference config — ImageNet 256x256.
 #
-# Mirrors `gmdit_k32_imagenet_piid_1step_test.py` with the GM-specific knobs
-# stripped out and the Fourier head wired in. Reference:
-#   personal-docs/worknotes/design/e5-sampler-orientation.md §3 (Track A).
+# Mirrors `gmdit_k32_imagenet_piid_1step_test.py` with the GM-specific
+# knobs replaced by the Fourier head (`use_fourier=True`, `num_harmonics=4`).
 #
 # Notes:
-#   • Uses `GMDiTTransformer2DModel` (V1) — the V2 variant does not yet carry
-#     the FourierOutput2D wiring (E4 only touched V1). Porting to V2 is a
-#     follow-up if/when V2 becomes the canonical class.
-#   • `pretrained=None` because no Fourier-trained checkpoint exists yet;
-#     swap in a path once one is produced.
-#   • `denoising_mean_mode='U'` is left at the parent default. It is only
-#     consumed in `loss()`, which is unreachable under `inference_only=True`.
-#     The Fourier head produces `x_hat_0` + `fourier_sin_coeffs` directly
-#     (FourierModelOutput); no u→x_0 conversion is needed.
+#   • Uses `GMDiTTransformer2DModel` (V1). Porting to V2 is deferred
+#     until V2 becomes the canonical class.
+#   • `pretrained=None` — no Fourier-trained checkpoint exists yet;
+#     set to a checkpoint path once one is available.
+#   • `denoising_mean_mode='U'` is the parent default and is only
+#     consumed by `loss()`, which is unreachable under `inference_only=True`.
+#     The Fourier head outputs `x_hat_0` + `fourier_sin_coeffs` directly
+#     (FourierModelOutput); no u→x_0 conversion is required.
 
 name = 'piflow_fourier_inference'
 

@@ -78,22 +78,24 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
 
         self.init_gm_cache()
 
-        # E1 smoke-test scaffolding (not production API): when set externally
-        # via `pipeline._smoke_test_vp = True`, route the GMFlow posterior call
-        # through the schedule-agnostic JIT with cosine VP (alpha, sigma).
-        # Decisions: D1b (signal-only gate at u_to_x_0), D2b (pass kwargs
-        # directly), D3c (smoke test = VP forward pass + linear bit-exact
-        # equivalence). See personal-docs/worknotes/design/e1-decisions.md.
+        # Validation scaffolding (not production API): when `_smoke_test_vp`
+        # is set on the pipeline instance, the GM posterior call is routed
+        # through the schedule-agnostic JIT using cosine VP (alpha, sigma)
+        # kwargs instead of the default linear (alpha = 1 - sigma) path.
+        # A RuntimeWarning is emitted to signal that u_to_x_0 still assumes
+        # the linear schedule internally, so VP samples produced via this
+        # path are not yet quantitatively trustworthy; the flag is intended
+        # for wiring / dispatch validation only.
         vp_mode = getattr(self, '_smoke_test_vp', False)
         if vp_mode:
             warnings.warn(
-                "GMDiTPipeline VP smoke test active: u_to_x_0 (line below) "
-                "silently assumes linear schedule alpha = 1 - sigma, so the "
-                "GM means feeding the posterior are NOT correct under VP. "
-                "Wrapper-dispatch wiring is exercised, but end-to-end VP "
-                "samples are not yet trustworthy. See "
-                "personal-docs/worknotes/scratch/u-to-x0-schedule-audit.md "
-                "for the planned follow-up PR.",
+                "GMDiTPipeline VP smoke test active: u_to_x_0 (called below) "
+                "assumes the linear schedule alpha = 1 - sigma, so GM means "
+                "feeding the posterior are NOT correct under a cosine VP "
+                "schedule. The schedule-agnostic dispatch wiring is exercised "
+                "end-to-end, but quantitative VP sample quality is not yet "
+                "validated. A follow-up PR will address u_to_x_0 for "
+                "non-linear schedules.",
                 RuntimeWarning,
                 stacklevel=2)
 
@@ -110,11 +112,10 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
                 class_labels=class_labels_input)
             gm_output = {k: v.to(torch.float32) for k, v in gm_output.items()}
 
-            # E1 (D1b, signal-only gate): u_to_x_0 silently assumes alpha =
-            # 1 - sigma. Under vp_mode this is acknowledged as wrong upstream
-            # (one-shot RuntimeWarning emitted at __call__ entry above).
-            # See u-to-x0-schedule-audit.md for the full set of latent-bug
-            # sites and the planned follow-up PR.
+            # u_to_x_0 assumes alpha = 1 - sigma (linear schedule). Under
+            # vp_mode this limitation is acknowledged by the RuntimeWarning
+            # emitted at __call__ entry above; production inference with a
+            # non-linear schedule requires a coordinated u_to_x_0 update.
             gm_output = self.u_to_x_0(gm_output, x_t_input, t)
 
             # ========== Probabilistic CFG ==========
@@ -159,11 +160,12 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
                 else:
                     assert output_mode == 'mean'
                     t = self.scheduler.timesteps[timestep_id * num_inference_substeps + substep_id]
-                    # E1 smoke-test (D2b, D3c): if vp_mode, compute cosine VP
-                    # (alpha, sigma) from the normalized timestep and pass all
-                    # four kwargs through the wrapper's schedule-agnostic JIT
-                    # path. Otherwise, fall through to the legacy linear path
-                    # untouched (preserves bit-exact behaviour for D3 (b)).
+                    # Under vp_mode, compute cosine VP (alpha, sigma) from
+                    # the normalised timestep and forward all four kwargs
+                    # through the schedule-agnostic JIT path.
+                    # Without vp_mode the legacy linear path is used, which
+                    # preserves bit-exact behaviour for the linear equivalence
+                    # regression test.
                     # `t` and `t_base` are tensors (from scheduler.timesteps),
                     # so use torch trig.
                     if vp_mode:

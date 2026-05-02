@@ -1,28 +1,20 @@
 # Copyright (c) 2026 youssefhemimy / NOCM-piFlow
 #
-# Idea-1 Fourier policy — boundary-pinned Fourier curve between
-# anchors (x_t_src, x̂_0), with sin-series correction.
+# Fourier policy — boundary-pinned Fourier curve between anchors
+# (x_t_src, x̂_0), with a sin-series correction term.
 #
-# Design references:
-#   • personal-docs/worknotes/design/idea1-anchor-design.md  (R1.2)
-#       — Option A anchors, τ(σ) = 1 − σ/σ_t_src, F2 velocity convention.
-#   • personal-docs/worknotes/design/idea1-basis-choice.md   (R4)
-#       — Decision: B0 (linear) boundary + sin-only residual (b_m ≡ 0).
-#
-# Schedule lock (mirrors gmflow.py:8-22 C4 comment):
-# This first cut is intentionally schedule-locked to alpha = 1 − sigma.
-# Two surfaces inside this class assume the linear/VE forward process;
-# routing a non-linear (alpha, sigma) here would silently miscompute:
-#   1. The boundary basis φ_0(τ)=1−τ, φ_1(τ)=τ has zero geometric residual
-#      at perfect prediction *only* under linear schedule (R4 §4.1).
-#      Under VP, B0 carries up to ~17% of ‖x_0‖ residual at σ_t_src ≈ 0.9
-#      (R4 §4.1 table) — the network must absorb that gap via a_m.
-#   2. The F2 velocity composition u = ∂_σ f = (∂_τ f) · (dτ/dσ) uses
-#      dτ/dσ = −1/σ_t_src which depends on τ(σ) = 1 − σ/σ_t_src; that
-#      τ-axis is itself schedule-agnostic (R4 §1.2), but the *meaning* of
-#      "zero geometric residual" downstream is schedule-dependent.
-# Routing a non-linear schedule here requires re-deriving B1 (R4 §2)
-# and re-checking the head's coefficient distribution; defer until then.
+# Schedule note:
+# This implementation is locked to the linear (VE) noise schedule
+# alpha = 1 − sigma. Two aspects of the formulation depend on this:
+#   1. The boundary basis φ_0(τ)=1−τ, φ_1(τ)=τ achieves zero geometric
+#      residual at perfect prediction only under the linear schedule. Under
+#      a non-linear (e.g. cosine VP) schedule the boundary basis absorbs a
+#      residual that the network's Fourier coefficients must compensate.
+#   2. The F2 velocity u = ∂_σ f uses dτ/dσ = −1/σ_t_src derived from
+#      τ(σ) = 1 − σ/σ_t_src; the τ-axis is schedule-agnostic, but the
+#      zero-residual guarantee at the boundary is schedule-dependent.
+# Supporting a non-linear schedule requires re-deriving the boundary basis
+# for VP and updating the coefficient distribution accordingly.
 
 import math
 
@@ -37,7 +29,7 @@ class FourierPolicy(BasePolicy):
     """Fourier policy. Represents the diffusion path between anchors as a
     boundary-pinned Fourier curve in τ ∈ [0, 1].
 
-    Path (R4 §2 B0 + sin-only residual, R1.2 §4 Option A anchors):
+    Path (linear-boundary basis + sin-only residual, Option A anchors):
 
         f(τ, ξ) = (1 − τ)·x_t_src(ξ) + τ·x̂_0(ξ)
                   + Σ_{m=1..M} a_m(ξ) · sin(m π τ)
@@ -103,7 +95,7 @@ class FourierPolicy(BasePolicy):
     def f(self, tau):
         """Evaluate the Fourier path f(τ, ξ) at τ.
 
-        Implements R4 §2 (B0 boundary + sin-only residual) under R1.2
+        Implements the linear-boundary + sin-only residual path under
         Option A anchors:
 
             f(τ) = (1 − τ)·x_t_src + τ·x̂_0 + Σ_m a_m · sin(m π τ)
@@ -127,12 +119,12 @@ class FourierPolicy(BasePolicy):
         return boundary + correction
 
     def df_dtau(self, tau):
-        """Analytic τ-derivative of the Fourier path (R1.2 §5.4(a), R4 §2).
+        """Analytic τ-derivative of the Fourier path.
 
             ∂f/∂τ = (x̂_0 − x_t_src) + Σ_m a_m · m π · cos(m π τ)
 
         Composing with dτ/dσ = −1/σ_t_src gives the F2 velocity
-        u = ∂_σ f = −(1/σ_t_src) · ∂_τ f — left to the pi method (E3-P3).
+        u = ∂_σ f = −(1/σ_t_src) · ∂_τ f — used by the `pi` method.
 
         Args:
             tau (torch.Tensor or scalar): Path parameter, shape (B,) or
@@ -154,8 +146,8 @@ class FourierPolicy(BasePolicy):
     def pi(self, x_t, sigma_t):
         """Compute the F2 flow velocity u_t = ∂_σ f at the query σ_t.
 
-        The Fourier path f(τ) is parametrised in τ(σ) = 1 − σ/σ_t_src
-        (R1.2 §4); the F2 chain rule (R1.2 §5.4(a)) gives
+        The Fourier path f(τ) is parametrised in τ(σ) = 1 − σ/σ_t_src; the
+        F2 chain rule gives
 
             u = ∂_σ f = (∂_τ f) · (dτ/dσ) = −(1/σ_t_src) · df_dtau(τ).
 
@@ -185,7 +177,7 @@ class FourierPolicy(BasePolicy):
 
         Bypasses the Euler substep loop in policy_rollout. Valid because f(τ) is
         analytic; the substep loop exists for policies (GMFlow, DX) whose pi is
-        not the derivative of a closed-form curve. See e5-sampler-orientation.md §3 B2.
+        not the derivative of a closed-form curve.
 
         Args:
             sigma_t_dst: destination noise level, shape (B,) or scalar.
