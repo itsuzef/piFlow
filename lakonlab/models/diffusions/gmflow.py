@@ -59,6 +59,73 @@ def gmflow_posterior_mean_jit(
 
     nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
     zeta = zeta.unsqueeze(gm_dim)  # (bs, *, 1, 1, 1, 1)
+    torch._assert(gm_vars.size(gm_dim) == 1,
+                  "gm_vars must be shared across mixture components (size at gm_dim != 1)")
+    torch._assert(gm_vars.size(channel_dim) == 1,
+                  "gm_vars must be shared across channels (size at channel_dim != 1)")
+    denom = (gm_vars * zeta + 1).clamp(min=eps)
+
+    out_means = (gm_vars * nu + gm_means) / denom
+    # (bs, *, num_gaussians, 1, h, w)
+    logweights_delta = (gm_means * (nu - 0.5 * zeta * gm_means)).sum(
+        dim=channel_dim, keepdim=True) / denom
+    out_weights = (gm_logweights + logweights_delta).softmax(dim=gm_dim)
+
+    out_mean = (out_means * out_weights).sum(dim=gm_dim)
+
+    return out_mean
+
+
+@torch.jit.script
+def gmflow_posterior_mean_jit_general(
+        alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
+        gm_means, gm_vars, gm_logweights,
+        eps: float, zeta_max: float = float('inf'),
+        gm_dim: int = -4, channel_dim: int = -3):
+    """Schedule-agnostic generalization of `gmflow_posterior_mean_jit`.
+
+    Accepts an arbitrary noise schedule via explicit `(alpha, sigma)` pairs
+    instead of assuming the linear/VE relation `alpha = 1 - sigma`. When
+    `alpha_t_src = 1 - sigma_t_src` and `alpha_t = 1 - sigma_t`, the output
+    is bit-exact identical to `gmflow_posterior_mean_jit` (verified across
+    20 seeds * 5 (B,K,C,H,W) configs in float32 + float64; see
+    `derivations/_test_differential_equivalence.py` in the parent repo).
+
+    The mathematical derivation (information-form Bayesian update of a
+    Gaussian-mixture prior with two Gaussian observations) is documented in
+    `derivations/01_posterior_rederivation.ipynb` (SymPy + numerical) and
+    `derivations/posterior_rederivation.nb` (Mathematica). The simplified
+    `logweights_delta` term used here is exact for the GMFlow case where
+    `gm_vars` is shared across the K mixture components (proven k-independent
+    in the Mathematica notebook; the precondition is enforced by the existing
+    GMFlow code paths).
+
+    The operator order in `nu` (`aos * x / sigma`, two divides) deliberately
+    mirrors `gmflow_posterior_mean_jit` so that the linear-schedule path is
+    bit-exact, not just within float epsilon.
+
+    `zeta_max`: analytic clamp on zeta before the denom computation. Prevents
+    overflow in `gm_vars * zeta + 1` for extreme (alpha/sigma) ratios, e.g.
+    VP schedule at very small t. Default `inf` disables the clamp (preserving
+    pre-C1 behaviour). The wrapper passes `torch.finfo(dtype).max / 10.0`
+    (assuming max var_k ≤ 10; see 03_rollout_plan.md §2.2 C1, Q1).
+    """
+    sigma_t_src = sigma_t_src.clamp(min=eps)
+    sigma_t = sigma_t.clamp(min=eps)
+
+    alpha_over_sigma_t_src = alpha_t_src / sigma_t_src
+    alpha_over_sigma_t = alpha_t / sigma_t
+
+    zeta = alpha_over_sigma_t.square() - alpha_over_sigma_t_src.square()
+    zeta = zeta.clamp(min=-zeta_max, max=zeta_max)
+    nu = alpha_over_sigma_t * x_t / sigma_t - alpha_over_sigma_t_src * x_t_src / sigma_t_src
+
+    nu = nu.unsqueeze(gm_dim)  # (bs, *, 1, out_channels, h, w)
+    zeta = zeta.unsqueeze(gm_dim)  # (bs, *, 1, 1, 1, 1)
+    torch._assert(gm_vars.size(gm_dim) == 1,
+                  "gm_vars must be shared across mixture components (size at gm_dim != 1)")
+    torch._assert(gm_vars.size(channel_dim) == 1,
+                  "gm_vars must be shared across channels (size at channel_dim != 1)")
     denom = (gm_vars * zeta + 1).clamp(min=eps)
 
     out_means = (gm_vars * nu + gm_means) / denom
@@ -117,10 +184,18 @@ class GMFlowMixin:
 
     def gmflow_posterior_mean(
             self, gm, x_t, x_t_src, t=None, t_src=None,
-            sigma_t_src=None, sigma_t=None, eps=1e-6, prediction_type='x0',
+            sigma_t_src=None, sigma_t=None,
+            alpha_t_src=None, alpha_t=None,
+            eps=1e-6, prediction_type='x0',
             checkpointing=False):
         """
         Fuse gmflow_posterior and gm_to_mean to avoid redundant computation.
+
+        Pass `alpha_t_src` and/or `alpha_t` to select a non-linear noise
+        schedule (e.g. VP: alpha=cos(pi*t/2), sigma=sin(pi*t/2)); the missing
+        member of the pair is filled in with `1 - sigma`. When both are
+        omitted, the call routes to the legacy `gmflow_posterior_mean_jit`
+        and behavior is bit-exact identical to prior versions.
         """
         assert isinstance(gm, dict)
 
@@ -149,16 +224,32 @@ class GMFlowMixin:
             gm_vars = (gm['logstds'] * 2).exp()  # (bs, *, 1, 1, 1, 1)
             gm['gm_vars'] = gm_vars
 
+        use_general = alpha_t_src is not None or alpha_t is not None
+        if use_general:
+            if alpha_t_src is None or alpha_t is None:
+                raise ValueError(
+                    "Pass both alpha_t_src and alpha_t, or neither. "
+                    "Passing only one is ambiguous and was never safe.")
+            # Analytic zeta clamp: prevents gm_vars*zeta overflow under VP
+            # schedule at small t.  Assumes max(gm_vars) ≤ 10 (see Q1 in
+            # 03_rollout_plan.md §6).  Use float32 finfo even for mixed
+            # precision — erring conservative is safe; the clamp only fires
+            # at extreme (alpha/sigma) ratios outside normal sampling ranges.
+            _zeta_max = float(torch.finfo(gm_vars.dtype).max) / 10.0
+            jit_fn = gmflow_posterior_mean_jit_general
+            args = (alpha_t_src, sigma_t_src, alpha_t, sigma_t, x_t_src, x_t,
+                    gm_means, gm_vars, gm_logweights, eps, _zeta_max)
+        else:
+            jit_fn = gmflow_posterior_mean_jit
+            args = (sigma_t_src, sigma_t, x_t_src, x_t,
+                    gm_means, gm_vars, gm_logweights, eps)
+
         if checkpointing and torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(
-                gmflow_posterior_mean_jit,
-                sigma_t_src, sigma_t, x_t_src, x_t,
-                gm_means, gm_vars, gm_logweights, eps,
+                jit_fn, *args,
                 use_reentrant=True)  # use_reentrant=False does not work with jit
         else:
-            return gmflow_posterior_mean_jit(
-                sigma_t_src, sigma_t, x_t_src, x_t,
-                gm_means, gm_vars, gm_logweights, eps)
+            return jit_fn(*args)
 
     def reverse_transition(self, denoising_output, x_t_high, t_low, t_high, eps=1e-6, prediction_type='u'):
         if isinstance(denoising_output, dict):
