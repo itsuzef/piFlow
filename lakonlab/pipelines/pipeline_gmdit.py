@@ -1,5 +1,6 @@
 # Copyright (c) 2025 Hansheng Chen
 
+import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -77,6 +78,25 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
 
         self.init_gm_cache()
 
+        # E1 smoke-test scaffolding (not production API): when set externally
+        # via `pipeline._smoke_test_vp = True`, route the GMFlow posterior call
+        # through the schedule-agnostic JIT with cosine VP (alpha, sigma).
+        # Decisions: D1b (signal-only gate at u_to_x_0), D2b (pass kwargs
+        # directly), D3c (smoke test = VP forward pass + linear bit-exact
+        # equivalence). See personal-docs/worknotes/design/e1-decisions.md.
+        vp_mode = getattr(self, '_smoke_test_vp', False)
+        if vp_mode:
+            warnings.warn(
+                "GMDiTPipeline VP smoke test active: u_to_x_0 (line below) "
+                "silently assumes linear schedule alpha = 1 - sigma, so the "
+                "GM means feeding the posterior are NOT correct under VP. "
+                "Wrapper-dispatch wiring is exercised, but end-to-end VP "
+                "samples are not yet trustworthy. See "
+                "personal-docs/worknotes/scratch/u-to-x0-schedule-audit.md "
+                "for the planned follow-up PR.",
+                RuntimeWarning,
+                stacklevel=2)
+
         for timestep_id in self.progress_bar(range(num_inference_steps)):
             t = self.scheduler.timesteps[timestep_id * num_inference_substeps]
 
@@ -89,6 +109,12 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
                 timestep=t.expand(x_t_input.size(0)),
                 class_labels=class_labels_input)
             gm_output = {k: v.to(torch.float32) for k, v in gm_output.items()}
+
+            # E1 (D1b, signal-only gate): u_to_x_0 silently assumes alpha =
+            # 1 - sigma. Under vp_mode this is acknowledged as wrong upstream
+            # (one-shot RuntimeWarning emitted at __call__ entry above).
+            # See u-to-x0-schedule-audit.md for the full set of latent-bug
+            # sites and the planned follow-up PR.
             gm_output = self.u_to_x_0(gm_output, x_t_input, t)
 
             # ========== Probabilistic CFG ==========
@@ -133,8 +159,27 @@ class GMDiTPipeline(DiTPipeline, GMFlowMixin):
                 else:
                     assert output_mode == 'mean'
                     t = self.scheduler.timesteps[timestep_id * num_inference_substeps + substep_id]
-                    model_output = self.gmflow_posterior_mean(
-                        gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
+                    # E1 smoke-test (D2b, D3c): if vp_mode, compute cosine VP
+                    # (alpha, sigma) from the normalized timestep and pass all
+                    # four kwargs through the wrapper's schedule-agnostic JIT
+                    # path. Otherwise, fall through to the legacy linear path
+                    # untouched (preserves bit-exact behaviour for D3 (b)).
+                    # `t` and `t_base` are tensors (from scheduler.timesteps),
+                    # so use torch trig.
+                    if vp_mode:
+                        t_bar = t / self.time_scaling
+                        t_src_bar = t_base / self.time_scaling
+                        alpha_t = torch.cos(torch.pi * t_bar / 2)
+                        alpha_t_src = torch.cos(torch.pi * t_src_bar / 2)
+                        sigma_t = torch.sin(torch.pi * t_bar / 2)
+                        sigma_t_src = torch.sin(torch.pi * t_src_bar / 2)
+                        model_output = self.gmflow_posterior_mean(
+                            gm_output, x_t, x_t_base, t, t_base, prediction_type='x0',
+                            alpha_t=alpha_t, alpha_t_src=alpha_t_src,
+                            sigma_t=sigma_t, sigma_t_src=sigma_t_src)
+                    else:
+                        model_output = self.gmflow_posterior_mean(
+                            gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
                 x_t = self.scheduler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
 
         x_t = x_t / self.vae.config.scaling_factor
