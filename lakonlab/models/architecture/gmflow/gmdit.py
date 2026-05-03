@@ -22,6 +22,8 @@ class _GMDiTTransformer2DModel(DiTTransformer2DModel):
     def __init__(
             self,
             num_gaussians=16,
+            num_harmonics=4,
+            use_fourier: bool = False,
             constant_logstd=None,
             logstd_inner_dim=1024,
             gm_num_logstd_layers=2,
@@ -59,7 +61,12 @@ class _GMDiTTransformer2DModel(DiTTransformer2DModel):
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.out_channels = in_channels if out_channels is None else out_channels
-        self.gm_channels = num_gaussians * (self.out_channels + 1)
+        # Flags read by forward() / init_weights(). The branch-specific
+        # channel-count attributes (gm_channels / fourier_channels) and the
+        # head_channels alias are set inside the head if/else below so each
+        # branch owns its own state and the dead one is never present.
+        self.num_harmonics = num_harmonics
+        self.use_fourier = use_fourier
         self.gradient_checkpointing = False
 
         # 2. Initialize the position embedding and transformer blocks.
@@ -94,16 +101,37 @@ class _GMDiTTransformer2DModel(DiTTransformer2DModel):
         # 3. Output blocks.
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
-        self.proj_out_2 = nn.Linear(
-            self.inner_dim, self.config.patch_size * self.config.patch_size * self.gm_channels)
 
-        self.gm_out = GMOutput2D(
-            num_gaussians,
-            self.out_channels,
-            self.inner_dim,
-            constant_logstd=constant_logstd,
-            logstd_inner_dim=logstd_inner_dim,
-            num_logstd_layers=gm_num_logstd_layers)
+        # Head selection — Fourier (Idea-1) or GMFlow. Mutually exclusive;
+        # each branch owns its channel-count attr (gm_channels or
+        # fourier_channels), the head_channels alias used by forward() /
+        # init_weights(), the proj_out_2 Linear sized accordingly, and the
+        # head module. The unused head slot is set to None so forward() /
+        # init_weights() can branch on `is not None`.
+        if use_fourier:
+            from .fourier_output import FourierOutput2D
+            self.fourier_channels = (num_harmonics + 1) * self.out_channels
+            self.head_channels = self.fourier_channels
+            self.proj_out_2 = nn.Linear(
+                self.inner_dim,
+                self.config.patch_size * self.config.patch_size * self.fourier_channels)
+            self.fourier_out = FourierOutput2D(
+                num_harmonics, self.out_channels, embed_dim=self.inner_dim)
+            self.gm_out = None
+        else:
+            self.gm_channels = num_gaussians * (self.out_channels + 1)
+            self.head_channels = self.gm_channels
+            self.proj_out_2 = nn.Linear(
+                self.inner_dim,
+                self.config.patch_size * self.config.patch_size * self.gm_channels)
+            self.gm_out = GMOutput2D(
+                num_gaussians,
+                self.out_channels,
+                self.inner_dim,
+                constant_logstd=constant_logstd,
+                logstd_inner_dim=logstd_inner_dim,
+                num_logstd_layers=gm_num_logstd_layers)
+            self.fourier_out = None
 
     # https://github.com/facebookresearch/DiT/blob/main/models.py
     def init_weights(self):
@@ -126,7 +154,33 @@ class _GMDiTTransformer2DModel(DiTTransformer2DModel):
         # Zero-out output layers
         constant_init(self.proj_out_1, val=0)
 
-        self.gm_out.init_weights()
+        if self.fourier_out is not None:
+            self.fourier_out.init_weights()
+            # Zero-init the M-coefficient slab of proj_out_2 so the network
+            # ships as a pure B0 baseline (f = linear interp between the two
+            # anchors) and learns the Fourier correction up from zero.
+            # Mirrors GMOutput2D's zero-init of the last logstd Linear layer.
+            #
+            # Slice math: proj_out_2 outputs `patch_size² * fourier_channels`
+            # values per token; the forward() reshape unpacks them as
+            # (..., patch_row, patch_col, channel) — channel is innermost
+            # (fastest-varying). View the weight as
+            # (p, p, fourier_channels, inner_dim) and zero `[:, :, C:, :]` at
+            # every patch position so x_hat_0 (the first C of each
+            # fourier_channels block) keeps its xavier init while every
+            # a_m slab is zeroed. A flat `weight[:M*C]` would only zero
+            # patch position (0, 0) when patch_size > 1.
+            weight_view = self.proj_out_2.weight.data.view(
+                self.patch_size, self.patch_size,
+                self.fourier_channels, self.inner_dim)
+            weight_view[:, :, self.out_channels:, :] = 0
+            if self.proj_out_2.bias is not None:
+                bias_view = self.proj_out_2.bias.data.view(
+                    self.patch_size, self.patch_size,
+                    self.fourier_channels)
+                bias_view[:, :, self.out_channels:] = 0
+        else:
+            self.gm_out.init_weights()
 
     def forward(
             self,
@@ -197,11 +251,14 @@ class _GMDiTTransformer2DModel(DiTTransformer2DModel):
         shift, scale = self.proj_out_1(F.silu(emb)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         hidden_states = self.proj_out_2(hidden_states).reshape(
-                bs, height, width, self.patch_size, self.patch_size, self.gm_channels
+                bs, height, width, self.patch_size, self.patch_size, self.head_channels
             ).permute(0, 5, 1, 3, 2, 4).reshape(
-                bs, self.gm_channels, height * self.patch_size, width * self.patch_size)
+                bs, self.head_channels, height * self.patch_size, width * self.patch_size)
 
-        return self.gm_out(hidden_states, cond_emb.detach())
+        if self.fourier_out is not None:
+            return self.fourier_out(hidden_states, cond_emb.detach())
+        else:
+            return self.gm_out(hidden_states, cond_emb.detach())
 
 
 @MODULES.register_module()
