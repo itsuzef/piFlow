@@ -4,14 +4,15 @@ training-only dependencies on macOS / CPU envs.
 
 Two patches, both runtime-only and scoped to test collection:
 
-1. Monkey-patch `mmcv.utils.registry.Registry._register_module` to ignore
-   "already registered" collisions. mmgen 0.7.x unconditionally registers
-   a `SiLU` activation that mmcv 1.7 already provides via torch >=1.7's
-   native `nn.SiLU`, producing a `KeyError: SiLU is already registered`
-   the moment any mmgen.models import runs. The collision is incidental
-   to the registry's design (force=False is the safe default for
-   production); silencing it during tests is harmless because we never
-   exercise registry-backed model construction.
+1. Monkey-patch Registry._register_module to ignore "already registered"
+   collisions. mmgen 0.7.x unconditionally registers a SiLU activation
+   that mmcv 1.7 already provides via torch >=1.7's native nn.SiLU,
+   producing a KeyError: SiLU is already registered the moment any
+   mmgen.models import runs. Silencing it during tests is harmless because
+   we never exercise registry-backed model construction.
+
+   Migration note: mmcv 2.x moved Registry to mmengine.registry; the
+   import below falls back gracefully for mmcv >= 2.0 environments.
 
 2. Stub `lakonlab.apis` and `lakonlab.datasets` in `sys.modules` so the
    `from .apis import *` and `from .datasets import *` lines in
@@ -28,9 +29,13 @@ import sys
 import types
 
 
-# --- Patch 1: tolerate duplicate registrations under mmcv 1.7 + torch 2.0 ---
+# --- Patch 1: tolerate duplicate registrations ---
+# mmcv 2.x moved Registry to mmengine; fall back gracefully.
 import mmcv  # noqa: E402 -- intentional ordering
-from mmcv.utils.registry import Registry  # noqa: E402
+try:
+    from mmcv.utils.registry import Registry  # mmcv < 2.0
+except ImportError:
+    from mmengine.registry import Registry  # mmcv >= 2.0
 
 _orig_register_module = Registry._register_module
 
